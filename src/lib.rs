@@ -133,7 +133,7 @@ impl Ledger {
     }
 
     fn get(&self, path: &str) -> Result<Value> {
-        let resp = self.http.get(format!("{}{}", self.repos(), path)).send()?;
+        let resp = self.http.get(format!("{}/{}", self.repos(), path)).send()?;
         Self::decode(resp)
     }
 
@@ -147,7 +147,7 @@ impl Ledger {
         let sig = self.key.sign(&base);
         let resp = self
             .http
-            .post(format!("{}{}", self.repos(), path_tail))
+            .post(format!("{}/{}", self.repos(), path_tail))
             .header("Idempotency-Key", idem)
             .header("X-Key-Id", &self.key.key_id)
             .header("X-Timestamp", &ts)
@@ -160,7 +160,11 @@ impl Ledger {
 
     fn decode(resp: reqwest::blocking::Response) -> Result<Value> {
         let status = resp.status().as_u16();
-        let v: Value = resp.json().unwrap_or(Value::Null);
+        // 硬化:非 JSON 回体(如误入 HTML 仓页)必须报错,静默 Null 是 v0.1.0 假空的直接根因
+        let v: Value = match resp.json() {
+            Ok(v) => v,
+            Err(e) => return Err(LedgerError::Api { status, message: format!("回体非 JSON({e});疑 URL 或路由错入") }),
+        };
         if status >= 400 {
             return Err(LedgerError::Api { status, message: v["error"].as_str().unwrap_or("回执不识别").to_string() });
         }
