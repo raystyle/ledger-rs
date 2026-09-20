@@ -59,12 +59,17 @@ impl KeyPair {
         let public_jwk = format!("{{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"{x}\"}}");
         // kid = sha256hex(字母键序紧凑 JSON)
         let key_id = sha256_hex(public_jwk.as_bytes());
-        Self { key_id, signing, public_jwk }
+        Self {
+            key_id,
+            signing,
+            public_jwk,
+        }
     }
 
     /// 从本地密档读私钥(原始 32 字节 hex 或 base64url;不进 argv 不进仓)。
     pub fn load_secret_hex(hex: &str) -> std::result::Result<Self, LedgerError> {
-        let bytes = hex_to_bytes(hex.trim()).ok_or_else(|| LedgerError::Key("私钥非 32 字节 hex".into()))?;
+        let bytes = hex_to_bytes(hex.trim())
+            .ok_or_else(|| LedgerError::Key("私钥非 32 字节 hex".into()))?;
         let sk = SigningKey::from_bytes(&{
             let mut a = [0u8; 32];
             a.copy_from_slice(&bytes);
@@ -82,11 +87,16 @@ fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
     if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
-    (0..32).map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()).collect()
+    (0..32)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+        .collect()
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn nonce() -> String {
@@ -96,9 +106,21 @@ fn nonce() -> String {
 
 /// 产物 kind 白名单(服务端同表;沉淀加原型加实现记录为语义面)。
 pub const ARTIFACT_KINDS: &[&str] = &[
-    "binary", "image", "wasm", "sbom", "schema", "openapi", "eval-set",
-    "benchmark", "runbook", "decision", "attested-report",
-    "experience", "lesson", "research", "prototype",
+    "binary",
+    "image",
+    "wasm",
+    "sbom",
+    "schema",
+    "openapi",
+    "eval-set",
+    "benchmark",
+    "runbook",
+    "decision",
+    "attested-report",
+    "experience",
+    "lesson",
+    "research",
+    "prototype",
 ];
 
 /// 验证类 attest(追加证据;promote/demote 归 omc)。
@@ -107,7 +129,7 @@ pub const ATTEST_TYPES: &[&str] = &["attest_dev", "attest_prod", "verification_f
 /// 标准客户端:GET 免签,POST 五头签名道。
 pub struct Ledger {
     repo_id: String,
-    key: KeyPair,
+    key: Option<KeyPair>,
     base: String,
     http: reqwest::blocking::Client,
 }
@@ -116,9 +138,25 @@ impl Ledger {
     pub fn new(repo_id: impl Into<String>, key: KeyPair) -> Self {
         Self {
             repo_id: repo_id.into(),
-            key,
+            key: Some(key),
             base: BASE_URL.to_string(),
-            http: reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(60)).build().expect("http client"),
+            http: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("http client"),
+        }
+    }
+
+    /// 只读构造（GET 面免签免私钥；写面调用即报错）。
+    pub fn read_only(repo_id: impl Into<String>) -> Self {
+        Self {
+            repo_id: repo_id.into(),
+            key: None,
+            base: BASE_URL.to_string(),
+            http: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .expect("http client"),
         }
     }
 
@@ -138,18 +176,22 @@ impl Ledger {
     }
 
     fn post_signed(&self, path_tail: &str, body: &Value, idem: &str) -> Result<Value> {
+        let key = self
+            .key
+            .as_ref()
+            .ok_or_else(|| LedgerError::Key("只读构造无私钥，写面不可用".into()))?;
         let body_text = serde_json::to_string(body).map_err(|e| LedgerError::Key(e.to_string()))?;
         let path = format!("/repos/{}/{}", self.repo_id, path_tail);
         let ts = now_secs().to_string();
         let nc = nonce();
         let body_hash = sha256_hex(body_text.as_bytes());
         let base = ["v1", "POST", &path, &ts, &nc, idem, &body_hash].join("\n");
-        let sig = self.key.sign(&base);
+        let sig = key.sign(&base);
         let resp = self
             .http
             .post(format!("{}/{}", self.repos(), path_tail))
             .header("Idempotency-Key", idem)
-            .header("X-Key-Id", &self.key.key_id)
+            .header("X-Key-Id", &key.key_id)
             .header("X-Timestamp", &ts)
             .header("X-Nonce", &nc)
             .header("X-Signature", sig)
@@ -163,17 +205,31 @@ impl Ledger {
         // 硬化:非 JSON 回体(如误入 HTML 仓页)必须报错,静默 Null 是 v0.1.0 假空的直接根因
         let v: Value = match resp.json() {
             Ok(v) => v,
-            Err(e) => return Err(LedgerError::Api { status, message: format!("回体非 JSON({e});疑 URL 或路由错入") }),
+            Err(e) => {
+                return Err(LedgerError::Api {
+                    status,
+                    message: format!("回体非 JSON({e});疑 URL 或路由错入"),
+                })
+            }
         };
         if status >= 400 {
-            return Err(LedgerError::Api { status, message: v["error"].as_str().unwrap_or("回执不识别").to_string() });
+            return Err(LedgerError::Api {
+                status,
+                message: v["error"].as_str().unwrap_or("回执不识别").to_string(),
+            });
         }
         Ok(v)
     }
 
     // ---- issue 面(增与读;status 推进/删除归 omc) ----
 
-    pub fn issue_new(&self, title: &str, kind: &str, acceptance: &str, body: Option<&str>) -> Result<u64> {
+    pub fn issue_new(
+        &self,
+        title: &str,
+        kind: &str,
+        acceptance: &str,
+        body: Option<&str>,
+    ) -> Result<u64> {
         let v = self.post_signed(
             "issues",
             &json!({ "title": title, "kind": kind, "acceptance": acceptance, "body": body }),
@@ -206,15 +262,40 @@ impl Ledger {
         deps: &[String],
         note: Option<&str>,
     ) -> Result<String> {
+        self.artifact_publish_full(
+            name, kind, digest, version, git_range, deps, note, None, None,
+        )
+    }
+
+    /// 完整形（v0.1.2）：summary 一行摘要与 outcome 结果倾向（success|failure）为
+    /// 服务端 payload 结构化字段，非正文拼接。
+    pub fn artifact_publish_full(
+        &self,
+        name: &str,
+        kind: &str,
+        digest: &str,
+        version: Option<&str>,
+        git_range: Option<&str>,
+        deps: &[String],
+        note: Option<&str>,
+        summary: Option<&str>,
+        outcome: Option<&str>,
+    ) -> Result<String> {
         let v = self.post_signed(
             "artifacts",
-            &json!({ "name": name, "kind": kind, "digest": digest, "version": version, "git_range": git_range, "deps": deps, "body": note }),
+            &json!({ "name": name, "kind": kind, "digest": digest, "version": version, "git_range": git_range, "deps": deps, "body": note, "summary": summary, "outcome": outcome }),
             &format!("pub-{}-{}", now_secs(), &nonce()[..6]),
         )?;
         Ok(v["artifact_id"].as_str().unwrap_or_default().to_string())
     }
 
-    pub fn artifact_attest(&self, artifact_id: &str, attest_type: &str, checks: Value, note: Option<&str>) -> Result<Value> {
+    pub fn artifact_attest(
+        &self,
+        artifact_id: &str,
+        attest_type: &str,
+        checks: Value,
+        note: Option<&str>,
+    ) -> Result<Value> {
         self.post_signed(
             &format!("artifacts/{artifact_id}/attestations"),
             &json!({ "type": attest_type, "payload": { "checks": checks }, "body": note }),
@@ -250,29 +331,58 @@ mod tests {
         let kp = KeyPair::generate();
         let recomputed = sha256_hex(kp.public_jwk.as_bytes());
         assert_eq!(kp.key_id, recomputed);
-        assert!(kp.public_jwk.starts_with("{\"crv\":\"Ed25519\",\"kty\":\"OKP\""));
+        assert!(kp
+            .public_jwk
+            .starts_with("{\"crv\":\"Ed25519\",\"kty\":\"OKP\""));
     }
 
     #[test]
     fn signature_base_and_verify_roundtrip() {
         let kp = KeyPair::generate();
-        let base = ["v1", "POST", "/repos/x/issues", "1789000000", "n1", "idem1", &sha256_hex(b"body")].join("\n");
+        let base = [
+            "v1",
+            "POST",
+            "/repos/x/issues",
+            "1789000000",
+            "n1",
+            "idem1",
+            &sha256_hex(b"body"),
+        ]
+        .join("\n");
         let sig_b64 = kp.sign(&base);
         let sig = ed25519_dalek::Signature::from_bytes(&{
-            let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
+            let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(sig_b64)
+                .unwrap();
             let mut a = [0u8; 64];
             a.copy_from_slice(&raw);
             a
         });
-        assert!(kp.signing.verifying_key().verify(base.as_bytes(), &sig).is_ok());
+        assert!(kp
+            .signing
+            .verifying_key()
+            .verify(base.as_bytes(), &sig)
+            .is_ok());
     }
 
     #[test]
     fn secret_hex_roundtrip() {
         let kp = KeyPair::generate();
-        let hex: String = kp.signing.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let hex: String = kp
+            .signing
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let kp2 = KeyPair::load_secret_hex(&hex).unwrap();
         assert_eq!(kp.key_id, kp2.key_id);
+    }
+
+    #[test]
+    fn read_only_writes_fail_and_reads_ok_shape() {
+        let ro = Ledger::read_only("github.com/x/y");
+        let wr = ro.issue_new("t", "bug", "a", None);
+        assert!(wr.is_err(), "只读构造写面必须报错（缺私钥早拦，不触网）");
     }
 
     #[test]
