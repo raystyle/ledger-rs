@@ -263,12 +263,13 @@ impl Ledger {
         note: Option<&str>,
     ) -> Result<String> {
         self.artifact_publish_full(
-            name, kind, digest, version, git_range, deps, note, None, None,
+            name, kind, digest, version, git_range, deps, note, None, None, None,
         )
     }
 
-    /// 完整形（v0.1.2）：summary 一行摘要与 outcome 结果倾向（success|failure）为
-    /// 服务端 payload 结构化字段，非正文拼接。
+    /// 完整形（v0.1.3）：summary 一行摘要与 outcome 结果倾向（success|failure）与
+    /// git_sha（提交锚，服务端落 artifacts 表）为结构化字段，非正文拼接。
+    #[allow(clippy::too_many_arguments)]
     pub fn artifact_publish_full(
         &self,
         name: &str,
@@ -280,10 +281,11 @@ impl Ledger {
         note: Option<&str>,
         summary: Option<&str>,
         outcome: Option<&str>,
+        git_sha: Option<&str>,
     ) -> Result<String> {
         let v = self.post_signed(
             "artifacts",
-            &json!({ "name": name, "kind": kind, "digest": digest, "version": version, "git_range": git_range, "deps": deps, "body": note, "summary": summary, "outcome": outcome }),
+            &json!({ "name": name, "kind": kind, "digest": digest, "version": version, "git_range": git_range, "deps": deps, "body": note, "summary": summary, "outcome": outcome, "git_sha": git_sha }),
             &format!("pub-{}-{}", now_secs(), &nonce()[..6]),
         )?;
         Ok(v["artifact_id"].as_str().unwrap_or_default().to_string())
